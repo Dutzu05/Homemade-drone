@@ -11,7 +11,6 @@ float gyroY_offset = -0.02f;
 float gyroZ_offset = 0.00f;
 unsigned long lastTime;
 unsigned long lastTelemetryTime;
-unsigned long lastPotChangeTime;
 const unsigned long TELEMETRY_INTERVAL_MS = 100;
 
 const int POT_PIN = 0;
@@ -36,19 +35,6 @@ const float MOTOR_RESISTANCE = 0.5f;
 const float DEG_PER_RAD = 57.2958f;
 const float STILL_GYRO_THRESHOLD = 0.03f;
 const float STILL_ACCEL_TOLERANCE = 0.6f;
-const float ANGLE_DEADBAND_DEG = 2.0f;
-const float ROLL_KP = 2.8f;
-const float ROLL_KD = 0.35f;
-const float PITCH_KP = 2.8f;
-const float PITCH_KD = 0.35f;
-const int MAX_AXIS_CORRECTION = 45;
-const int POT_STABILITY_THRESHOLD = 12;
-const unsigned long POT_STABLE_TIME_MS = 250;
-const int MIN_STABILIZE_PWM = 35;
-const int POT_FILTER_SAMPLES = 8;
-
-int lastPotValue = 0;
-int filteredPotValue = 0;
 
 float estimateAverageVoltage(int dutyCycle) {
   return BATTERY_VOLTAGE * ((float)dutyCycle / (float)PWM_MAX);
@@ -57,24 +43,6 @@ float estimateAverageVoltage(int dutyCycle) {
 float estimateCurrent(float voltage) {
   if (voltage < 0.1f) return 0.0f;
   return voltage / MOTOR_RESISTANCE;
-}
-
-int readPotAveraged() {
-  long sum = 0;
-  for (int i = 0; i < POT_FILTER_SAMPLES; i++) {
-    sum += analogRead(POT_PIN);
-    delayMicroseconds(150);
-  }
-  return (int)(sum / POT_FILTER_SAMPLES);
-}
-
-int getPwmChannelForPin(int pin) {
-  for (int i = 0; i < NUM_PWM_PINS; i++) {
-    if (PWM_PINS[i] == pin) {
-      return PWM_CHANNELS[i];
-    }
-  }
-  return -1;
 }
 
 void printMotorTelemetry(const char* motorName, int pin, int dutyCycle) {
@@ -92,65 +60,6 @@ void printMotorTelemetry(const char* motorName, int pin, int dutyCycle) {
   Serial.print(iEst, 2);
   Serial.print("A | rpm=N/A");
   Serial.println();
-}
-
-float applyDeadband(float value, float deadband) {
-  if (fabs(value) <= deadband) {
-    return 0.0f;
-  }
-  return value > 0.0f ? value - deadband : value + deadband;
-}
-
-void computeMotorOutputs(int baseDutyCycle,
-                         int potValue,
-                         float rollErrorDeg,
-                         float pitchErrorDeg,
-                         float gyroX,
-                         float gyroY,
-                         int motorDutyCycles[NUM_PWM_PINS],
-                         float &rollCorrection,
-                         float &pitchCorrection,
-                         bool &stabilizationActive) {
-  for (int i = 0; i < NUM_PWM_PINS; i++) {
-    motorDutyCycles[i] = baseDutyCycle;
-  }
-
-  if (abs(potValue - lastPotValue) > POT_STABILITY_THRESHOLD) {
-    lastPotChangeTime = millis();
-  }
-  lastPotValue = potValue;
-
-  bool potStable = (millis() - lastPotChangeTime) >= POT_STABLE_TIME_MS;
-  stabilizationActive = potStable && baseDutyCycle >= MIN_STABILIZE_PWM;
-
-  if (!stabilizationActive) {
-    rollCorrection = 0.0f;
-    pitchCorrection = 0.0f;
-    return;
-  }
-
-  float rollRateDeg = gyroX * DEG_PER_RAD;
-  float pitchRateDeg = gyroY * DEG_PER_RAD;
-
-  float rollErrorForControl = applyDeadband(rollErrorDeg, ANGLE_DEADBAND_DEG);
-  float pitchErrorForControl = applyDeadband(pitchErrorDeg, ANGLE_DEADBAND_DEG);
-
-  rollCorrection = -(ROLL_KP * rollErrorForControl + ROLL_KD * rollRateDeg);
-  pitchCorrection = -(PITCH_KP * pitchErrorForControl + PITCH_KD * pitchRateDeg);
-
-  rollCorrection = constrain(rollCorrection, -MAX_AXIS_CORRECTION, MAX_AXIS_CORRECTION);
-  pitchCorrection = constrain(pitchCorrection, -MAX_AXIS_CORRECTION, MAX_AXIS_CORRECTION);
-
-  float motorAdjustments[NUM_PWM_PINS];
-  motorAdjustments[0] = rollCorrection + pitchCorrection;   // Motor 1 -> pin 4
-  motorAdjustments[1] = rollCorrection - pitchCorrection;   // Motor 2 -> pin 3
-  motorAdjustments[2] = -rollCorrection - pitchCorrection;  // Motor 3 -> pin 7
-  motorAdjustments[3] = -rollCorrection + pitchCorrection;  // Motor 4 -> pin 6
-
-  for (int i = 0; i < NUM_PWM_PINS; i++) {
-    int adjustedDuty = baseDutyCycle + (int)round(motorAdjustments[i]);
-    motorDutyCycles[i] = constrain(adjustedDuty, 0, PWM_MAX);
-  }
 }
 
 void updateImuTelemetry(float &accX, float &accY, float &accZ,
@@ -232,9 +141,6 @@ void setup() {
 
   analogReadResolution(ADC_RESOLUTION);
 
-  filteredPotValue = readPotAveraged();
-  lastPotValue = filteredPotValue;
-
   for (int i = 0; i < NUM_PWM_PINS; i++) {
     ledcSetup(PWM_CHANNELS[i], PWM_FREQ, PWM_RESOLUTION);
     ledcAttachPin(PWM_PINS[i], PWM_CHANNELS[i]);
@@ -243,7 +149,6 @@ void setup() {
 
   lastTime = micros();
   lastTelemetryTime = millis();
-  lastPotChangeTime = millis();
 }
 
 void loop() {
@@ -255,28 +160,12 @@ void loop() {
   float gyroZ = 0.0f;
   updateImuTelemetry(accX, accY, accZ, gyroX, gyroY, gyroZ);
 
-  int rawPotValue = readPotAveraged();
-  filteredPotValue = (filteredPotValue * 3 + rawPotValue) / 4;
-
-  int baseDutyCycle = map(filteredPotValue, 0, ADC_MAX, 0, PWM_MAX);
-  baseDutyCycle = constrain(baseDutyCycle, 0, PWM_MAX);
-
-  float rollErrorDeg = roll - rollTrim;
-  float pitchErrorDeg = pitch - pitchTrim;
-  int motorDutyCycles[NUM_PWM_PINS];
-  float rollCorrection = 0.0f;
-  float pitchCorrection = 0.0f;
-  bool stabilizationActive = false;
-
-  computeMotorOutputs(baseDutyCycle, filteredPotValue, rollErrorDeg, pitchErrorDeg,
-                      gyroX, gyroY, motorDutyCycles, rollCorrection,
-                      pitchCorrection, stabilizationActive);
+  int potValue = analogRead(POT_PIN);
+  int dutyCycle = map(potValue, 0, ADC_MAX, 0, PWM_MAX);
+  dutyCycle = constrain(dutyCycle, 0, PWM_MAX);
 
   for (int i = 0; i < NUM_PWM_PINS; i++) {
-    int channel = getPwmChannelForPin(MOTOR_REPORT_PINS[i]);
-    if (channel >= 0) {
-      ledcWrite(channel, motorDutyCycles[i]);
-    }
+    ledcWrite(PWM_CHANNELS[i], dutyCycle);
   }
 
   if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
@@ -285,9 +174,9 @@ void loop() {
     Serial.println("----- Telemetry Snapshot -----");
 
     Serial.print("POSITION | Ruliu: ");
-    Serial.print(rollErrorDeg, 1);
+    Serial.print(roll - rollTrim, 1);
     Serial.print(" deg | Tangaj: ");
-    Serial.print(pitchErrorDeg, 1);
+    Serial.print(pitch - pitchTrim, 1);
     Serial.print(" deg | Girație (Yaw): ");
     Serial.print(yaw, 1);
     Serial.println(" deg");
@@ -309,21 +198,12 @@ void loop() {
     Serial.println(" rad/s");
 
     Serial.print("INPUT    | Pot: ");
-    Serial.print(rawPotValue);
-    Serial.print(" | PotFilt: ");
-    Serial.print(filteredPotValue);
+    Serial.print(potValue);
     Serial.print(" | PWM_CMD: ");
-    Serial.println(baseDutyCycle);
-
-    Serial.print("CTRL     | mode=");
-    Serial.print(stabilizationActive ? "HOLD" : "THROTTLE");
-    Serial.print(" | roll_corr=");
-    Serial.print(rollCorrection, 1);
-    Serial.print(" | pitch_corr=");
-    Serial.println(pitchCorrection, 1);
+    Serial.println(dutyCycle);
 
     for (int i = 0; i < NUM_PWM_PINS; i++) {
-      printMotorTelemetry(MOTOR_NAMES[i], MOTOR_REPORT_PINS[i], motorDutyCycles[i]);
+      printMotorTelemetry(MOTOR_NAMES[i], MOTOR_REPORT_PINS[i], dutyCycle);
     }
 
     Serial.println();
