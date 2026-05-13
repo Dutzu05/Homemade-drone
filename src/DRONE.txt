@@ -678,3 +678,14 @@ Main logic
 
   Next useful step would be to document the exact sign convention experimentally for roll and pitch and verify each motor correction
   direction one axis at a time.
+
+
+
+
+
+
+  Raw Value: 2635
+
+  sender DC:B4:D9:8B:02:88
+
+  drone DC:B4:D9:8B:1A:B8

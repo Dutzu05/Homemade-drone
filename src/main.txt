@@ -2,8 +2,6 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
-#include <WiFi.h>
-#include <esp_now.h>
 
 Adafruit_MPU6050 mpu;
 float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
@@ -15,6 +13,8 @@ unsigned long lastTime;
 unsigned long lastTelemetryTime;
 unsigned long lastPotChangeTime;
 const unsigned long TELEMETRY_INTERVAL_MS = 100;
+
+const int POT_PIN = 0;
 
 const int PWM_PINS[] = {3, 4, 6, 7};
 const int NUM_PWM_PINS = 4;
@@ -28,6 +28,7 @@ const int PWM_FREQ = 20000;
 const int PWM_RESOLUTION = 8;
 const int PWM_MAX = 255;
 
+const int ADC_RESOLUTION = 12;
 const int ADC_MAX = 4095;
 
 const float BATTERY_VOLTAGE = 3.6f;
@@ -44,21 +45,7 @@ const int MAX_AXIS_CORRECTION = 45;
 const int POT_STABILITY_THRESHOLD = 12;
 const unsigned long POT_STABLE_TIME_MS = 250;
 const int MIN_STABILIZE_PWM = 35;
-
-typedef struct {
-  uint16_t potValue;
-  int16_t rollInput;
-  int16_t pitchInput;
-  uint32_t sequence;
-} CommandPacket;
-
-const uint8_t SENDER_MAC[] = {0xDC, 0xB4, 0xD9, 0x8B, 0x02, 0x88};
-
-volatile uint16_t latestPotValue = 0;
-volatile int16_t latestRollInput = 0;
-volatile int16_t latestPitchInput = 0;
-volatile uint32_t latestPacketSequence = 0;
-volatile bool commandReceived = false;
+const int POT_FILTER_SAMPLES = 8;
 
 int lastPotValue = 0;
 int filteredPotValue = 0;
@@ -72,6 +59,15 @@ float estimateCurrent(float voltage) {
   return voltage / MOTOR_RESISTANCE;
 }
 
+int readPotAveraged() {
+  long sum = 0;
+  for (int i = 0; i < POT_FILTER_SAMPLES; i++) {
+    sum += analogRead(POT_PIN);
+    delayMicroseconds(150);
+  }
+  return (int)(sum / POT_FILTER_SAMPLES);
+}
+
 int getPwmChannelForPin(int pin) {
   for (int i = 0; i < NUM_PWM_PINS; i++) {
     if (PWM_PINS[i] == pin) {
@@ -79,25 +75,6 @@ int getPwmChannelForPin(int pin) {
     }
   }
   return -1;
-}
-
-void onEspNowReceive(const uint8_t* mac, const uint8_t* data, int len) {
-  if (memcmp(mac, SENDER_MAC, 6) != 0) {
-    return;
-  }
-
-  if (len != sizeof(CommandPacket)) {
-    return;
-  }
-
-  CommandPacket packet;
-  memcpy(&packet, data, sizeof(packet));
-
-  latestPotValue = packet.potValue;
-  latestRollInput = packet.rollInput;
-  latestPitchInput = packet.pitchInput;
-  latestPacketSequence = packet.sequence;
-  commandReceived = true;
 }
 
 void printMotorTelemetry(const char* motorName, int pin, int dutyCycle) {
@@ -125,9 +102,7 @@ float applyDeadband(float value, float deadband) {
 }
 
 void computeMotorOutputs(int baseDutyCycle,
-                         int commandValue,
-                         int rollInput,
-                         int pitchInput,
+                         int potValue,
                          float rollErrorDeg,
                          float pitchErrorDeg,
                          float gyroX,
@@ -135,48 +110,42 @@ void computeMotorOutputs(int baseDutyCycle,
                          int motorDutyCycles[NUM_PWM_PINS],
                          float &rollCorrection,
                          float &pitchCorrection,
-                         float &rollCommandCorrection,
-                         float &pitchCommandCorrection,
                          bool &stabilizationActive) {
   for (int i = 0; i < NUM_PWM_PINS; i++) {
     motorDutyCycles[i] = baseDutyCycle;
   }
 
-  rollCommandCorrection = ((float)rollInput / 1000.0f) * MAX_AXIS_CORRECTION;
-  pitchCommandCorrection = ((float)pitchInput / 1000.0f) * MAX_AXIS_CORRECTION;
-
-  if (abs(commandValue - lastPotValue) > POT_STABILITY_THRESHOLD) {
+  if (abs(potValue - lastPotValue) > POT_STABILITY_THRESHOLD) {
     lastPotChangeTime = millis();
   }
-  lastPotValue = commandValue;
+  lastPotValue = potValue;
 
   bool potStable = (millis() - lastPotChangeTime) >= POT_STABLE_TIME_MS;
   stabilizationActive = potStable && baseDutyCycle >= MIN_STABILIZE_PWM;
 
-  if (stabilizationActive) {
-    float rollRateDeg = gyroX * DEG_PER_RAD;
-    float pitchRateDeg = gyroY * DEG_PER_RAD;
-
-    float rollErrorForControl = applyDeadband(rollErrorDeg, ANGLE_DEADBAND_DEG);
-    float pitchErrorForControl = applyDeadband(pitchErrorDeg, ANGLE_DEADBAND_DEG);
-
-    rollCorrection = -(ROLL_KP * rollErrorForControl + ROLL_KD * rollRateDeg);
-    pitchCorrection = -(PITCH_KP * pitchErrorForControl + PITCH_KD * pitchRateDeg);
-
-    rollCorrection = constrain(rollCorrection, -MAX_AXIS_CORRECTION, MAX_AXIS_CORRECTION);
-    pitchCorrection = constrain(pitchCorrection, -MAX_AXIS_CORRECTION, MAX_AXIS_CORRECTION);
-  } else {
+  if (!stabilizationActive) {
     rollCorrection = 0.0f;
     pitchCorrection = 0.0f;
+    return;
   }
 
+  float rollRateDeg = gyroX * DEG_PER_RAD;
+  float pitchRateDeg = gyroY * DEG_PER_RAD;
+
+  float rollErrorForControl = applyDeadband(rollErrorDeg, ANGLE_DEADBAND_DEG);
+  float pitchErrorForControl = applyDeadband(pitchErrorDeg, ANGLE_DEADBAND_DEG);
+
+  rollCorrection = -(ROLL_KP * rollErrorForControl + ROLL_KD * rollRateDeg);
+  pitchCorrection = -(PITCH_KP * pitchErrorForControl + PITCH_KD * pitchRateDeg);
+
+  rollCorrection = constrain(rollCorrection, -MAX_AXIS_CORRECTION, MAX_AXIS_CORRECTION);
+  pitchCorrection = constrain(pitchCorrection, -MAX_AXIS_CORRECTION, MAX_AXIS_CORRECTION);
+
   float motorAdjustments[NUM_PWM_PINS];
-  float totalRollCorrection = rollCorrection + rollCommandCorrection;
-  float totalPitchCorrection = pitchCorrection + pitchCommandCorrection;
-  motorAdjustments[0] = totalRollCorrection + totalPitchCorrection;   // Motor 1 -> pin 4
-  motorAdjustments[1] = totalRollCorrection - totalPitchCorrection;   // Motor 2 -> pin 3
-  motorAdjustments[2] = -totalRollCorrection - totalPitchCorrection;  // Motor 3 -> pin 7
-  motorAdjustments[3] = -totalRollCorrection + totalPitchCorrection;  // Motor 4 -> pin 6
+  motorAdjustments[0] = rollCorrection + pitchCorrection;   // Motor 1 -> pin 4
+  motorAdjustments[1] = rollCorrection - pitchCorrection;   // Motor 2 -> pin 3
+  motorAdjustments[2] = -rollCorrection - pitchCorrection;  // Motor 3 -> pin 7
+  motorAdjustments[3] = -rollCorrection + pitchCorrection;  // Motor 4 -> pin 6
 
   for (int i = 0; i < NUM_PWM_PINS; i++) {
     int adjustedDuty = baseDutyCycle + (int)round(motorAdjustments[i]);
@@ -227,11 +196,11 @@ void calibrateLevelTrim() {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
 
-    float accRoll = atan2(a.acceleration.y, a.acceleration.z) * DEG_PER_RAD;
+    float accRoll = atan2(a.acceleration.y, a.acceleration.z) * 57.2958f;
     float accPitch = atan2(
       -a.acceleration.x,
       sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)
-    ) * DEG_PER_RAD;
+    ) * 57.2958f;
 
     accRollSum += accRoll;
     accPitchSum += accPitch;
@@ -243,18 +212,6 @@ void calibrateLevelTrim() {
   roll = 0.0f;
   pitch = 0.0f;
   yaw = 0.0f;
-}
-
-bool setupEspNow() {
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-
-  if (esp_now_init() != ESP_OK) {
-    return false;
-  }
-
-  esp_now_register_recv_cb(onEspNowReceive);
-  return true;
 }
 
 void setup() {
@@ -273,12 +230,10 @@ void setup() {
     calibrateLevelTrim();
   }
 
-  if (!setupEspNow()) {
-    Serial.println("ESP-NOW init failed!");
-  }
+  analogReadResolution(ADC_RESOLUTION);
 
-  filteredPotValue = 0;
-  lastPotValue = 0;
+  filteredPotValue = readPotAveraged();
+  lastPotValue = filteredPotValue;
 
   for (int i = 0; i < NUM_PWM_PINS; i++) {
     ledcSetup(PWM_CHANNELS[i], PWM_FREQ, PWM_RESOLUTION);
@@ -300,9 +255,7 @@ void loop() {
   float gyroZ = 0.0f;
   updateImuTelemetry(accX, accY, accZ, gyroX, gyroY, gyroZ);
 
-  int rawPotValue = commandReceived ? (int)latestPotValue : 0;
-  int rollInput = commandReceived ? (int)latestRollInput : 0;
-  int pitchInput = commandReceived ? (int)latestPitchInput : 0;
+  int rawPotValue = readPotAveraged();
   filteredPotValue = (filteredPotValue * 3 + rawPotValue) / 4;
 
   int baseDutyCycle = map(filteredPotValue, 0, ADC_MAX, 0, PWM_MAX);
@@ -313,15 +266,11 @@ void loop() {
   int motorDutyCycles[NUM_PWM_PINS];
   float rollCorrection = 0.0f;
   float pitchCorrection = 0.0f;
-  float rollCommandCorrection = 0.0f;
-  float pitchCommandCorrection = 0.0f;
   bool stabilizationActive = false;
 
-  computeMotorOutputs(baseDutyCycle, filteredPotValue, rollInput, pitchInput,
-                      rollErrorDeg, pitchErrorDeg, gyroX, gyroY,
-                      motorDutyCycles, rollCorrection, pitchCorrection,
-                      rollCommandCorrection, pitchCommandCorrection,
-                      stabilizationActive);
+  computeMotorOutputs(baseDutyCycle, filteredPotValue, rollErrorDeg, pitchErrorDeg,
+                      gyroX, gyroY, motorDutyCycles, rollCorrection,
+                      pitchCorrection, stabilizationActive);
 
   for (int i = 0; i < NUM_PWM_PINS; i++) {
     int channel = getPwmChannelForPin(MOTOR_REPORT_PINS[i]);
@@ -359,29 +308,19 @@ void loop() {
     Serial.print(gyroZ, 3);
     Serial.println(" rad/s");
 
-    Serial.print("INPUT    | PotRx: ");
+    Serial.print("INPUT    | Pot: ");
     Serial.print(rawPotValue);
     Serial.print(" | PotFilt: ");
     Serial.print(filteredPotValue);
     Serial.print(" | PWM_CMD: ");
-    Serial.print(baseDutyCycle);
-    Serial.print(" | RollCmd: ");
-    Serial.print(rollInput);
-    Serial.print(" | PitchCmd: ");
-    Serial.print(pitchInput);
-    Serial.print(" | Seq: ");
-    Serial.println((unsigned long)latestPacketSequence);
+    Serial.println(baseDutyCycle);
 
     Serial.print("CTRL     | mode=");
     Serial.print(stabilizationActive ? "HOLD" : "THROTTLE");
     Serial.print(" | roll_corr=");
     Serial.print(rollCorrection, 1);
     Serial.print(" | pitch_corr=");
-    Serial.print(pitchCorrection, 1);
-    Serial.print(" | roll_cmd=");
-    Serial.print(rollCommandCorrection, 1);
-    Serial.print(" | pitch_cmd=");
-    Serial.println(pitchCommandCorrection, 1);
+    Serial.println(pitchCorrection, 1);
 
     for (int i = 0; i < NUM_PWM_PINS; i++) {
       printMotorTelemetry(MOTOR_NAMES[i], MOTOR_REPORT_PINS[i], motorDutyCycles[i]);
