@@ -1,0 +1,46 @@
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+Adafruit_MPU6050 mpu;
+
+float roll = 0, pitch = 0;
+float gyroX_offset = -0.07, gyroY_offset = -0.02;
+unsigned long lastTime;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(8, 9);
+  if (!mpu.begin()) { while (1); }
+  
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  
+  lastTime = micros();
+}
+
+void loop() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // 1. Calculate time passed (dt)
+  unsigned long currentTime = micros();
+  float dt = (currentTime - lastTime) / 1000000.0;
+  lastTime = currentTime;
+
+  // 2. Get Angles from Accelerometer (The "Ground Truth")
+  // atan2 calculates the angle based on gravity
+  float accRoll  = atan2(a.acceleration.y, a.acceleration.z) * 57.2958;
+  float accPitch = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 57.2958;
+
+  // 3. Integrate Gyro data and Combine with Accelerometer (Complementary Filter)
+  // We give 96% weight to the Gyro (smooth) and 4% to the Accel (steady)
+  roll  = 0.96 * (roll + (g.gyro.x - gyroX_offset) * 57.2958 * dt) + 0.04 * accRoll;
+  pitch = 0.96 * (pitch + (g.gyro.y - gyroY_offset) * 57.2958 * dt) + 0.04 * accPitch;
+
+  Serial.print("Ruliu (Roll): "); Serial.print(roll);
+  Serial.print(" | Tangaj (Pitch): "); Serial.println(pitch);
+
+  delay(10); // Run faster for smoother stabilization
+}

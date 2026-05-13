@@ -1,0 +1,691 @@
+#include <Arduino.h>
+
+// Potentiometer input pin
+const int POT_PIN = 0;   // GPIO0 / ADC input
+
+// PWM output pins connected to H-bridges
+const int PWM_PINS[] = {3, 4, 6, 7};
+const int NUM_PWM_PINS = 4;
+
+// PWM channels for ESP32 LEDC
+const int PWM_CHANNELS[] = {0, 1, 2, 3};
+
+// PWM settings
+const int PWM_FREQ = 20000;       // 20 kHz
+const int PWM_RESOLUTION = 8;     // 8-bit PWM: 0 - 255
+
+// ADC settings
+const int ADC_RESOLUTION = 12;    // 12-bit ADC: 0 - 4095
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("ESP32-C3 Potentiometer PWM Control");
+
+  // Configure ADC resolution
+  analogReadResolution(ADC_RESOLUTION);
+
+  // Configure PWM channels and attach pins
+  for (int i = 0; i < NUM_PWM_PINS; i++) {
+    ledcSetup(PWM_CHANNELS[i], PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(PWM_PINS[i], PWM_CHANNELS[i]);
+    ledcWrite(PWM_CHANNELS[i], 0);
+  }
+}
+
+void loop() {
+  // Read potentiometer value: 0 - 4095
+  int potValue = analogRead(POT_PIN);
+
+  // Convert ADC value to PWM duty cycle: 0 - 255
+  int dutyCycle = map(potValue, 0, 4095, 0, 255);
+  dutyCycle = constrain(dutyCycle, 0, 255);
+
+  // Send the same PWM signal to all 4 H-bridge inputs
+  for (int i = 0; i < NUM_PWM_PINS; i++) {
+    ledcWrite(PWM_CHANNELS[i], dutyCycle);
+  }
+
+  Serial.print("Potentiometer: ");
+  Serial.print(potValue);
+  Serial.print(" | PWM duty: ");
+  Serial.println(dutyCycle);
+
+  delay(20);
+}
+
+
+
+
+
+
+
+
+
+
+#include <Arduino.h>
+
+const int POT_PIN = 21;
+
+const int PWM_PINS[] = {3, 4, 6, 7};
+const int PWM_CHANNELS[] = {0, 1, 2, 3};
+const int NUM_PWM_PINS = 4;
+
+const int PWM_FREQ = 20000;
+const int PWM_RESOLUTION = 8;
+const int PWM_MAX = (1 << PWM_RESOLUTION) - 1;
+
+const int ADC_RESOLUTION = 12;
+
+// Set these from real measured values with the pot powered from 3.3V.
+const int POT_MIN = 0;
+const int POT_MAX = 4095;
+
+// Deadband near zero to keep the motors stopped until the stick really moves.
+const int START_DEADBAND = 40;
+
+// Minimum PWM that reliably starts the motors once above the deadband.
+const int MIN_EFFECTIVE_PWM = 55;
+
+// Filtering values. Higher = smoother, lower = faster response.
+const int ADC_SAMPLES = 32;
+const float FILTER_ALPHA = 0.12f;
+
+int readPotAveraged(int samples = ADC_SAMPLES) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(POT_PIN);
+    delayMicroseconds(250);
+  }
+  return sum / samples;
+}
+
+int applyExponentialFilter(int input) {
+  static bool initialized = false;
+  static float filtered = 0.0f;
+
+  if (!initialized) {
+    filtered = (float)input;
+    initialized = true;
+  } else {
+    filtered += FILTER_ALPHA * ((float)input - filtered);
+  }
+
+  return (int)(filtered + 0.5f);
+}
+
+int potToDuty(int potValue) {
+  potValue = constrain(potValue, POT_MIN, POT_MAX);
+
+  int throttle = map(potValue, POT_MIN, POT_MAX, 0, PWM_MAX);
+  throttle = constrain(throttle, 0, PWM_MAX);
+
+  if (throttle <= START_DEADBAND) {
+    return 0;
+  }
+
+  return map(throttle, START_DEADBAND + 1, PWM_MAX, MIN_EFFECTIVE_PWM, PWM_MAX);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("ESP32-C3 Potentiometer PWM Control");
+  Serial.println("Wire the potentiometer to 3.3V, not 5V.");
+
+  analogReadResolution(ADC_RESOLUTION);
+
+  for (int i = 0; i < NUM_PWM_PINS; i++) {
+    ledcSetup(PWM_CHANNELS[i], PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(PWM_PINS[i], PWM_CHANNELS[i]);
+    ledcWrite(PWM_CHANNELS[i], 0);
+  }
+}
+
+void loop() {
+  int rawPotValue = readPotAveraged();
+  int filteredPotValue = applyExponentialFilter(rawPotValue);
+  int dutyCycle = potToDuty(filteredPotValue);
+
+  for (int i = 0; i < NUM_PWM_PINS; i++) {
+    ledcWrite(PWM_CHANNELS[i], dutyCycle);
+  }
+
+  Serial.print("Raw: ");
+  Serial.print(rawPotValue);
+  Serial.print(" | Filtered: ");
+  Serial.print(filteredPotValue);
+  Serial.print(" | PWM duty: ");
+  Serial.println(dutyCycle);
+
+  delay(20);
+}
+
+
+
+
+#include <Arduino.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+// --- SENSOR OBJECTS & VARIABLES ---
+Adafruit_MPU6050 mpu;
+float roll = 0, pitch = 0, yaw = 0;
+float gyroX_offset = -0.07f;
+float gyroY_offset = -0.02f;
+float gyroZ_offset = 0.00f;
+unsigned long lastTime;
+unsigned long lastTelemetryTime;
+
+// Potentiometer input pin
+const int POT_PIN = 0;
+
+// PWM output pins connected to H-bridges
+const int PWM_PINS[] = {3, 4, 6, 7};
+const int NUM_PWM_PINS = 4;
+
+// PWM channels for ESP32 LEDC
+const int PWM_CHANNELS[] = {0, 1, 2, 3};
+
+// Motor report order
+const int MOTOR_REPORT_PINS[] = {4, 3, 7, 6};
+const char* MOTOR_NAMES[] = {"Motor 1", "Motor 2", "Motor 3", "Motor 4"};
+
+// PWM settings
+const int PWM_FREQ = 20000;
+const int PWM_RESOLUTION = 8;
+const int PWM_MAX = 255;
+
+// ADC settings
+const int ADC_RESOLUTION = 12;
+const int ADC_MAX = 4095;
+
+// Power model constants
+const float BATTERY_VOLTAGE = 3.6f;
+const float MOTOR_RESISTANCE = 0.5f;
+
+float estimateAverageVoltage(int dutyCycle) {
+  return BATTERY_VOLTAGE * ((float)dutyCycle / (float)PWM_MAX);
+}
+
+float estimateCurrent(float voltage) {
+  if (voltage < 0.1f) return 0.0f;
+  return voltage / MOTOR_RESISTANCE;
+}
+
+void printMotorTelemetry(const char* motorName, int pin, int dutyCycle) {
+  float vAvg = estimateAverageVoltage(dutyCycle);
+  float iEst = estimateCurrent(vAvg);
+
+  Serial.print(motorName);
+  Serial.print(" | pin=");
+  Serial.print(pin);
+  Serial.print(" | pwm=");
+  Serial.print(dutyCycle);
+  Serial.print(" | v=");
+  Serial.print(vAvg, 2);
+  Serial.print("V | curr=");
+  Serial.print(iEst, 2);
+  Serial.print("A | rpm=N/A");
+  Serial.println();
+}
+
+void updateImuTelemetry(float &accX, float &accY, float &accZ,
+                        float &gyroX, float &gyroY, float &gyroZ) {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  unsigned long currentTime = micros();
+  float dt = (currentTime - lastTime) / 1000000.0f;
+  lastTime = currentTime;
+
+  accX = a.acceleration.x;
+  accY = a.acceleration.y;
+  accZ = a.acceleration.z;
+
+  gyroX = g.gyro.x - gyroX_offset;
+  gyroY = g.gyro.y - gyroY_offset;
+  gyroZ = g.gyro.z - gyroZ_offset;
+
+  float accRoll = atan2(accY, accZ) * 57.2958f;
+  float accPitch = atan2(-accX, sqrt(accY * accY + accZ * accZ)) * 57.2958f;
+
+  roll = 0.96f * (roll + gyroX * 57.2958f * dt) + 0.04f * accRoll;
+  pitch = 0.96f * (pitch + gyroY * 57.2958f * dt) + 0.04f * accPitch;
+  yaw = yaw + gyroZ * 57.2958f * dt;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(8, 9);
+
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 connection failed!");
+  } else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  analogReadResolution(ADC_RESOLUTION);
+
+  for (int i = 0; i < NUM_PWM_PINS; i++) {
+    ledcSetup(PWM_CHANNELS[i], PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(PWM_PINS[i], PWM_CHANNELS[i]);
+    ledcWrite(PWM_CHANNELS[i], 0);
+  }
+
+  lastTime = micros();
+  lastTelemetryTime = millis();
+}
+
+void loop() {
+  float accX = 0.0f;
+  float accY = 0.0f;
+  float accZ = 0.0f;
+  float gyroX = 0.0f;
+  float gyroY = 0.0f;
+  float gyroZ = 0.0f;
+  updateImuTelemetry(accX, accY, accZ, gyroX, gyroY, gyroZ);
+
+  int potValue = analogRead(POT_PIN);
+  int dutyCycle = map(potValue, 0, ADC_MAX, 0, PWM_MAX);
+  dutyCycle = constrain(dutyCycle, 0, PWM_MAX);
+
+  for (int i = 0; i < NUM_PWM_PINS; i++) {
+    ledcWrite(PWM_CHANNELS[i], dutyCycle);
+  }
+
+  if (millis() - lastTelemetryTime >= 1000) {
+    lastTelemetryTime = millis();
+
+    Serial.println("----- Telemetry Snapshot -----");
+
+    Serial.print("POSITION | Ruliu: ");
+    Serial.print(roll, 1);
+    Serial.print(" deg | Tangaj: ");
+    Serial.print(pitch, 1);
+    Serial.print(" deg | Girație (Yaw): ");
+    Serial.print(yaw, 1);
+    Serial.println(" deg");
+
+    Serial.print("ACCEL    | X: ");
+    Serial.print(accX, 2);
+    Serial.print(" | Y: ");
+    Serial.print(accY, 2);
+    Serial.print(" | Z: ");
+    Serial.print(accZ, 2);
+    Serial.println(" m/s^2");
+
+    Serial.print("GYRO     | X: ");
+    Serial.print(gyroX, 3);
+    Serial.print(" | Y: ");
+    Serial.print(gyroY, 3);
+    Serial.print(" | Z: ");
+    Serial.print(gyroZ, 3);
+    Serial.println(" rad/s");
+
+    Serial.print("INPUT    | Pot: ");
+    Serial.print(potValue);
+    Serial.print(" | PWM_CMD: ");
+    Serial.println(dutyCycle);
+
+    for (int i = 0; i < NUM_PWM_PINS; i++) {
+      printMotorTelemetry(MOTOR_NAMES[i], MOTOR_REPORT_PINS[i], dutyCycle);
+    }
+
+    Serial.println();
+  }
+
+  delay(10);
+}
+
+
+Main logic
+
+  The code has 4 separate jobs:
+
+  1. Read the IMU and estimate drone angles
+  2. Read the potentiometer and convert it to a base throttle PWM
+  3. Decide whether stabilization is allowed
+  4. Mix throttle + stabilization corrections into 4 motor outputs
+
+  ———
+
+  Constants and variables
+
+  roll, pitch, yaw
+
+  - Estimated drone angles in degrees
+  - roll = Ruliu
+  - pitch = Tangaj
+  - yaw = rotation around vertical axis
+
+  rollTrim, pitchTrim
+
+  - Startup offsets
+  - They make roll/pitch show near 0 when the drone is level at boot
+
+  gyroX_offset, gyroY_offset, gyroZ_offset
+
+  - Gyroscope bias corrections
+  - Raw gyro has small nonzero values even when still, so these are subtracted
+
+  lastTime
+
+  - Previous timestamp for IMU integration
+  - Used to compute dt
+
+  lastTelemetryTime
+
+  - Used so Serial Monitor prints only every TELEMETRY_INTERVAL_MS
+
+  lastPotChangeTime
+
+  - Stores when the pot last changed significantly
+  - Used to decide whether the pilot command is stable
+
+  TELEMETRY_INTERVAL_MS = 100
+
+  - Serial monitor refresh interval
+  - 100 ms means about 10 updates per second
+
+  POT_PIN = 0
+
+  - Potentiometer ADC input pin
+
+  PWM_PINS[] = {3,4,6,7}
+
+  - Physical pins going to the H-bridges
+
+  PWM_CHANNELS[] = {0,1,2,3}
+
+  - ESP32 PWM generator channels
+
+  MOTOR_REPORT_PINS[] = {4,3,7,6}
+
+  - Your requested motor numbering:
+  - Motor 1 -> pin 4
+  - Motor 2 -> pin 3
+  - Motor 3 -> pin 7
+  - Motor 4 -> pin 6
+
+  PWM_FREQ = 20000
+
+  - PWM frequency = 20 kHz
+
+  PWM_RESOLUTION = 8
+
+  - PWM goes from 0..255
+
+  ADC_RESOLUTION = 12
+
+  - ADC goes from 0..4095
+
+  BATTERY_VOLTAGE = 3.6
+
+  - Used only for estimated electrical telemetry
+
+  MOTOR_RESISTANCE = 0.5
+
+  - Used only for estimated current telemetry
+  - This is a rough model, not a real measurement
+
+  DEG_PER_RAD = 57.2958
+
+  - Converts radians to degrees
+
+  STILL_GYRO_THRESHOLD = 0.03
+
+  - If gyro is below this, drone is considered almost still rotationally
+
+  STILL_ACCEL_TOLERANCE = 0.6
+
+  - If total acceleration is near 9.81 m/s^2, drone is considered not being linearly accelerated much
+
+  ANGLE_DEADBAND_DEG = 2.0
+
+  - Hysteresis band
+  - If roll/pitch error is within +-2 deg, no correction is applied on that axis
+
+  ROLL_KP, PITCH_KP = 2.8
+
+  - Proportional gains
+  - Bigger angle error -> stronger correction
+
+  ROLL_KD, PITCH_KD = 0.35
+
+  - Derivative gains
+  - Faster angular motion -> extra damping correction
+
+  MAX_AXIS_CORRECTION = 45
+
+  - Limits how much correction one axis can add/subtract from PWM
+
+  POT_STABILITY_THRESHOLD = 12
+
+  - If filtered pot changes by more than 12 ADC counts, it is treated as a new pilot input
+
+  POT_STABLE_TIME_MS = 250
+
+  - Pot must stay stable for 250 ms before stabilization is allowed
+
+  MIN_STABILIZE_PWM = 35
+
+  - Stabilization only works above this throttle
+  - Below that, motors may not respond consistently
+
+  POT_FILTER_SAMPLES = 8
+
+  - Number of ADC samples averaged for pot reading
+
+  lastPotValue
+
+  - Previous filtered pot value used for stability detection
+
+  filteredPotValue
+
+  - Smoothed pot value used by control
+
+  ———
+
+  Functions
+
+  estimateAverageVoltage(int dutyCycle)
+
+  - Converts PWM duty to estimated average motor voltage
+  - Formula:
+
+  battery_voltage * duty / 255
+
+  - Only an estimate for telemetry
+
+  estimateCurrent(float voltage)
+
+  - Converts estimated voltage to estimated current
+  - Formula:
+
+  I = V / R
+
+  - Again, only telemetry, not real sensing
+
+  getPwmChannelForPin(int pin)
+
+  - Finds which LEDC channel belongs to a given pin
+  - Needed because your motor numbering order is different from your PWM pin array order
+
+  readPotAveraged()
+
+  - Reads the potentiometer 8 times and averages it
+  - Purpose:
+      - reduce ADC noise
+      - make stability detection reliable
+
+  printMotorTelemetry(...)
+
+  - Prints one motor line in Serial Monitor
+  - Shows:
+      - pin
+      - PWM
+      - estimated voltage
+      - estimated current
+      - RPM as N/A
+
+  applyDeadband(value, deadband)
+
+  - Implements hysteresis around zero
+  - If angle error is small, return 0
+  - If outside band, subtract the deadband edge so correction starts smoothly
+
+  Example:
+
+  - error +1.2, deadband 2.0 -> output 0
+  - error +5.0 -> output +3.0
+  - error -5.0 -> output -3.0
+
+  updateImuTelemetry(accX, accY, accZ, gyroX, gyroY, gyroZ)
+
+  - Reads MPU6050
+  - Computes dt
+  - Applies gyro offsets
+  - Computes accelerometer-based roll/pitch
+  - Runs complementary filter:
+      - gyro gives smooth short-term motion
+      - accelerometer pulls estimate back to physical gravity direction
+  - Also adjusts filter weights if drone is still
+
+  This is the attitude estimator.
+
+  calibrateLevelTrim()
+
+  - Runs at startup while drone is still
+  - Takes many accelerometer samples
+  - Computes average roll/pitch seen at rest
+  - Stores them in rollTrim and pitchTrim
+  - This defines your “level = zero” reference
+
+  computeMotorOutputs(...)
+
+  - Core stabilization function
+
+  It does these steps:
+
+  1. Start all motors at the same baseDutyCycle
+  2. Check if potentiometer changed enough to count as a new command
+  3. Decide if stabilization is active:
+      - pot must be stable long enough
+      - throttle must be above minimum
+  4. If not active:
+      - all motors stay at base throttle
+  5. If active:
+      - compute roll and pitch control corrections
+      - use PD control:
+
+  correction = -(Kp * angle_error + Kd * angular_rate)
+
+  6. Limit correction magnitude
+  7. Mix the corrections into the 4 motors according to your requested motor logic
+
+  Motor mixing:
+
+  - Motor 1 = +roll +pitch
+  - Motor 2 = +roll -pitch
+  - Motor 3 = -roll -pitch
+  - Motor 4 = -roll +pitch
+
+  That matches your rules.
+
+  ———
+
+  Why THROTTLE vs HOLD
+
+  THROTTLE
+
+  - Means pilot is still moving the pot, or throttle is too low
+  - Code does not try to stabilize
+  - All motors get nearly the same base PWM
+
+  HOLD
+
+  - Means pot is stable and throttle is high enough
+  - Code applies roll/pitch corrections to keep level
+
+  ———
+
+  Serial monitor values
+
+  POSITION
+
+  - Ruliu = roll error after trim
+  - Tangaj = pitch error after trim
+  - Yaw = integrated gyro heading
+
+  ACCEL
+
+  - Raw acceleration from MPU6050 in m/s^2
+
+  GYRO
+
+  - Bias-corrected angular velocity in rad/s
+
+  INPUT
+
+  - Pot = averaged raw pot read
+  - PotFilt = smoothed pot value used for control
+  - PWM_CMD = base throttle before stabilization mixing
+
+  CTRL
+
+  - mode=THROTTLE or mode=HOLD
+  - roll_corr = roll correction amount
+  - pitch_corr = pitch correction amount
+
+  Motor N
+
+  - Final PWM actually sent to that motor
+  - Estimated voltage/current
+
+  ———
+
+  Control idea in plain terms
+
+  - Pot sets the common throttle
+  - If pot is still, the drone is assumed to be in “hold attitude” mode
+  - If tilt is small, ignore it
+  - If tilt is larger:
+      - add power to motors on one side
+      - subtract same amount from opposite side
+  - Gyro term damps motion so it does not react too slowly or oscillate too much
+
+  ———
+
+  Important limitation
+
+  This is only a basic stabilizer. It is not a full safe flight controller yet because:
+
+  - no real ESC/motor RPM feedback
+  - no true current/voltage sensing
+  - no yaw stabilization reference
+  - no full PID tuning workflow
+  - no arming/failsafe logic
+
+  The current code is appropriate for bench calibration and first stabilization experiments, not final flight safety.
+
+  Next useful step would be to document the exact sign convention experimentally for roll and pitch and verify each motor correction
+  direction one axis at a time.
+
+
+
+
+
+
+  Raw Value: 2635
+
+  sender DC:B4:D9:8B:02:88
+
+  drone DC:B4:D9:8B:1A:B8
